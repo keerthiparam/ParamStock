@@ -7,6 +7,7 @@ from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from twilio.rest import Client
 import os
+import requests # Need this for the search API
 
 # --- Load Configuration ---
 with open('config.yaml', 'r') as f:
@@ -34,7 +35,7 @@ class Alert(db.Model):
     phone_number = db.Column(db.String(20), nullable=False)
     ticker = db.Column(db.String(20), nullable=False)
     target_price = db.Column(db.Float, nullable=False)
-    condition = db.Column(db.String(4), nullable=False) # 'gte', 'lte', 'gt', 'lt'
+    condition = db.Column(db.String(10), nullable=False) # 'above' or 'below'
     delete_on_trigger = db.Column(db.Boolean, default=False, nullable=False)
     alert_sent = db.Column(db.Boolean, default=False, nullable=False)
 
@@ -65,7 +66,28 @@ def delete_alert(alert_id):
         return jsonify({'message': 'Alert deleted!'}), 200
     return jsonify({'error': 'Alert not found'}), 404
 
-# --- Price Checker Logic (to run in a background thread) ---
+# NEW: API endpoint to search for stock tickers
+@app.route('/api/search')
+def search_ticker():
+    query = request.args.get('query', '')
+    if not query:
+        return jsonify([])
+    
+    # Use Yahoo Finance's unofficial search API
+    url = f"https://query1.finance.yahoo.com/v1/finance/search?q={query}"
+    headers = {'User-Agent': 'Mozilla/5.0'} # Pretend to be a browser
+    try:
+        res = requests.get(url, headers=headers)
+        data = res.json()
+        results = []
+        for item in data.get('quotes', []):
+            if 'symbol' in item and 'longname' in item:
+                results.append({'symbol': item['symbol'], 'name': item['longname']})
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# --- Price Checker Logic ---
 def price_checker_worker():
     print("Background Price Checker: Thread started.")
     twilio_client = Client(TWILIO_CONFIG['account_sid'], TWILIO_CONFIG['auth_token'])
@@ -81,40 +103,33 @@ def price_checker_worker():
     def send_whatsapp_alert(message, to_number):
         try:
             twilio_client.messages.create(
-                body=message, from_=TWILIO_CONFIG['phone_number'],
-                to=f"whatsapp:{to_number}"
+                body=message, from_=TWILIO_CONFIG['phone_number'], to=f"whatsapp:{to_number}"
             )
-            print(f"Checker: Sent alert for {alert.ticker} to {to_number}")
+            print(f"Checker: Sent alert to {to_number}")
         except Exception as e:
             print(f"Checker: Error sending WhatsApp - {e}")
 
     while True:
         with app.app_context():
             active_alerts = Alert.query.filter_by(alert_sent=False).all()
-            if active_alerts:
-                print(f"Checker: Found {len(active_alerts)} active alerts.")
             
             for alert in active_alerts:
                 price = get_stock_price(alert.ticker)
                 if not price: continue
                 
+                # UPDATED: Simplified condition logic
                 triggered = False
-                if alert.condition == 'gte' and price >= alert.target_price: triggered = True
-                elif alert.condition == 'lte' and price <= alert.target_price: triggered = True
-                elif alert.condition == 'gt' and price > alert.target_price: triggered = True
-                elif alert.condition == 'lt' and price < alert.target_price: triggered = True
+                if alert.condition == 'above' and price > alert.target_price: triggered = True
+                elif alert.condition == 'below' and price < alert.target_price: triggered = True
 
                 if triggered:
-                    message = f"🚨 *Stock Alert!* 🚨\n\n*{alert.ticker}* is now at *₹{price:.2f}*.\nYour target was: Price {alert.condition} ₹{alert.target_price:.2f}."
-                    
-                    # --- THIS WAS THE MISSING PIECE ---
+                    message = f"🚨 *Stock Alert!* 🚨\n\n*{alert.ticker}* is now at *₹{price:.2f}*."
                     send_whatsapp_alert(message, alert.phone_number)
-                    # ------------------------------------
                     
                     if alert.delete_on_trigger:
                         db.session.delete(alert)
                     else:
-                        alert.sent = True
+                        alert.alert_sent = True # Corrected from 'sent'
                     db.session.commit()
         time.sleep(CHECK_INTERVAL)
 
@@ -122,9 +137,7 @@ def price_checker_worker():
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-
     checker_thread = threading.Thread(target=price_checker_worker, daemon=True)
     checker_thread.start()
-
     print("🚀 Backend server starting... Access the web app via frontend.py.")
     app.run(port=5000, debug=True, use_reloader=False)
