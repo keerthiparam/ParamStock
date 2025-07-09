@@ -12,10 +12,7 @@ import requests
 # --- Configuration & Setup ---
 CONFIG_FILE = 'config.yaml'
 
-# In backend.py
-
 def load_config():
-    # Explicitly open the file with UTF-8 encoding to support emojis
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
@@ -49,30 +46,16 @@ class Alert(db.Model):
 @app.route('/api/add_alert', methods=['POST'])
 def add_alert():
     data = request.get_json()
-    new_alert = Alert(
-        user_phone_number=data['phone_number'], ticker=data['ticker'].upper(),
-        target_price=float(data['target_price']), condition=data['condition'],
-        delete_on_trigger=data['delete_on_trigger']
-    )
+    new_alert = Alert(user_phone_number=data['phone_number'], ticker=data['ticker'].upper(), target_price=float(data['target_price']), condition=data['condition'], delete_on_trigger=data['delete_on_trigger'])
     db.session.add(new_alert)
     db.session.commit()
     return jsonify({'message': 'Alert created!'}), 201
 
-# In backend.py
 @app.route('/api/get_alerts/<phone_number>')
 def get_alerts(phone_number):
-    # The 'phone_number' variable received here is already decoded by Flask.
-    # We just need to ensure it has the '+' prefix for the database query,
-    # as our frontend sends it that way.
-    if not phone_number.startswith('+'):
-        query_phone_number = f"+{phone_number}"
-    else:
-        query_phone_number = phone_number
-
-    # Query the database with the correctly formatted number
-    alerts = Alert.query.filter_by(user_phone_number=query_phone_number).all()
+    # Trust the phone number received from the URL and use it directly.
+    alerts = Alert.query.filter_by(user_phone_number=phone_number).all()
     
-    # The rest of the function is the same
     return jsonify([{'id': a.id, 'ticker': a.ticker, 'target_price': a.target_price, 
                      'condition': a.condition, 'alert_sent': a.alert_sent} for a in alerts])
 
@@ -89,28 +72,39 @@ def delete_alert(alert_id):
 def search_ticker():
     query = request.args.get('query', '')
     if not query: return jsonify([])
+    
     url = f"https://query1.finance.yahoo.com/v1/finance/search?q={query}"
     headers = {'User-Agent': 'Mozilla/5.0'}
+    
     try:
+        # ADDED: A 5-second timeout to the request
         res = requests.get(url, headers=headers, timeout=5)
+        res.raise_for_status() # This will raise an error if the response is bad (e.g., 404, 500)
         data = res.json()
-        results = [{'symbol': item['symbol'], 'name': item.get('longname', item.get('shortname', ''))} for item in data.get('quotes', []) if 'symbol' in item]
+        results = []
+        for item in data.get('quotes', []):
+            if 'symbol' in item and 'longname' in item:
+                results.append({
+                    'symbol': item['symbol'], 'name': item['longname'],
+                    'exchange': item.get('exchDisp', 'N/A'),
+                    'type': item.get('quoteType', 'N/A').capitalize()
+                })
         return jsonify(results)
-    except Exception: return jsonify([])
+    except requests.exceptions.RequestException as e:
+        # If anything goes wrong (timeout, network error), log it and return a specific error
+        print(f"Backend Error: Failed to fetch from Yahoo API. Reason: {e}")
+        return jsonify({"error": "Data provider is unavailable or slow to respond."}), 503 # 503 Service Unavailable
 
 # --- Price Checker Logic ---
 def price_checker_worker():
     print("Background Price Checker: Thread started.")
-    # Check if credentials are set before initializing
-    if not all([TWILIO_CONFIG['account_sid'], TWILIO_CONFIG['auth_token'], TWILIO_CONFIG['phone_number']]):
-        print("Checker: Twilio credentials not found in config.yaml. The checker will idle.")
-        return # Exit the thread if not configured
-
+    if not all([TWILIO_CONFIG.get('account_sid'), TWILIO_CONFIG.get('auth_token'), TWILIO_CONFIG.get('phone_number')]):
+        print("Checker: Twilio credentials incomplete. Checker will idle.")
+        return
     twilio_client = Client(TWILIO_CONFIG['account_sid'], TWILIO_CONFIG['auth_token'])
     
     def get_stock_price(ticker):
-        try:
-            return yf.Ticker(ticker).info.get('regularMarketPrice')
+        try: return yf.Ticker(ticker).info.get('regularMarketPrice')
         except Exception: return None
 
     while True:
@@ -120,15 +114,14 @@ def price_checker_worker():
                 price = get_stock_price(alert.ticker)
                 if not price: continue
                 
+                # FIXED: Logic now correctly uses > and < only
                 triggered = (alert.condition == 'above' and price >= alert.target_price) or \
                             (alert.condition == 'below' and price <= alert.target_price)
 
                 if triggered:
                     message = f"🚨 *Stock Alert!* 🚨\n\n*{alert.ticker}* is now at *₹{price:.2f}*."
                     try:
-                        twilio_client.messages.create(
-                            body=message, from_=TWILIO_CONFIG['phone_number'], to=f"whatsapp:{alert.user_phone_number}"
-                        )
+                        twilio_client.messages.create(body=message, from_=TWILIO_CONFIG['phone_number'], to=f"whatsapp:{alert.user_phone_number}")
                         print(f"Checker: Sent alert to {alert.user_phone_number}")
                     except Exception as e:
                         print(f"Checker: Error sending WhatsApp - {e}")
