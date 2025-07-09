@@ -1,8 +1,9 @@
-# frontend.py
+# frontend.py (Definitive, Stabilized Version)
 import streamlit as st
 import requests
 import yaml
 import time
+from streamlit_searchbox import st_searchbox
 
 # --- Configuration & Helper Functions ---
 BACKEND_URL = "http://127.0.0.1:5000"
@@ -17,22 +18,36 @@ def save_config(config):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         yaml.dump(config, f, default_flow_style=False)
 
-@st.cache_data(ttl=300)
-def fetch_search_results(search_term: str) -> dict: # Now returns a dictionary
-    if not search_term:
-        return {"data": []} # Return in a consistent format
+# Reset function to avoid session state bugs
+def reset_searchbox_state():
+    st.session_state["stock_searchbox"] = {
+        "options_js": [],
+        "key_react": f"react-key-{time.time()}",
+        "result": None,
+        "search": ""  # 🔥 Add this line to avoid KeyError: 'search'
+    }
+
+# --- THE STABILIZED SEARCH FUNCTION ---
+def search_tickers(search_term: str) -> list[tuple[str, str]]:
+    if not search_term or len(search_term) < 2:
+        return [("INFO", "Keep typing to search...")]
     try:
         res = requests.get(f"{BACKEND_URL}/api/search", params={'query': search_term})
-        response_data = res.json()
-        # Check if the backend returned an error message
-        if 'error' in response_data:
-            return {"error": response_data['error']}
-        return {"data": response_data}
-    except (requests.ConnectionError, requests.exceptions.JSONDecodeError):
-        # Handle cases where the backend is completely down
-        return {"error": "Cannot connect to the backend server."}
+        res.raise_for_status()
+        search_results = res.json()
+        formatted_results = [
+            (item['symbol'], f"{item['name']} ({item['symbol']})")
+            for item in search_results if item.get('name')
+        ]
+        if not formatted_results:
+            return [("NO_RESULTS", "No stocks found, please try another search.")]
+        return formatted_results
+    except requests.exceptions.RequestException:
+        return [("ERROR", "⚠️ Error connecting to the data source.")]
+    except ValueError:
+        return [("ERROR", "⚠️ Received invalid data from the server.")]
 
-# --- App Initialization & State Management ---
+# --- App Initialization & Onboarding ---
 st.set_page_config(page_title="ParamStock Alerter", layout="centered")
 
 config = load_config()
@@ -40,13 +55,15 @@ APP_CONFIG = config['app_config']
 TWILIO_CONFIG = config['twilio']
 USER_CONFIG = config['user']
 
-if 'selected_stock' not in st.session_state:
-    st.session_state.selected_stock = None
-
 def is_configured():
-    return all([TWILIO_CONFIG.get('account_sid'), TWILIO_CONFIG.get('auth_token'), TWILIO_CONFIG.get('phone_number'), USER_CONFIG.get('phone_number')])
+    return all([
+        TWILIO_CONFIG.get('account_sid'),
+        TWILIO_CONFIG.get('auth_token'),
+        TWILIO_CONFIG.get('phone_number'),
+        USER_CONFIG.get('phone_number')
+    ])
 
-# === ONBOARDING LOGIC (No changes needed) ===
+# === ONBOARDING LOGIC ===
 if not is_configured():
     st.title("👋 Welcome to the Smart Stock Alerter!")
     st.markdown("Let's get you set up in a few simple steps.")
@@ -80,69 +97,62 @@ col1, col2 = st.columns([1, 1.2])
 with col1:
     st.header(APP_CONFIG['header'])
 
-    # --- THE "SINGLE WIDGET ILLUSION" IMPLEMENTATION ---
-    if not st.session_state.selected_stock:
-        search_term = st.text_input("Search for a stock...", placeholder="e.g., Reliance, SBI, Apple")
-        results_container = st.empty()
+    # Ensure searchbox state is properly initialized
+    if "stock_searchbox" not in st.session_state or not isinstance(st.session_state["stock_searchbox"], dict):
+        reset_searchbox_state()
 
-        if search_term:
-            # The search function now returns a dictionary with 'data' or 'error'
-            result_payload = fetch_search_results(search_term)
+    selected_ticker = st_searchbox(
+        search_function=search_tickers,
+        placeholder="Search for a stock (e.g., Reliance...)",
+        label="Search and Select a Stock",
+        key="stock_searchbox"
+    )
 
-            if "error" in result_payload:
-                results_container.error(f"⚠️ {result_payload['error']}")
-            
-            elif result_payload.get("data"):
-                search_results = result_payload["data"]
-                with results_container.container():
-                    st.write("---")
-                    st.write("**Search Results:**")
-                    for item in search_results:
-                        if item.get('name'):
-                            if st.button(f"{item['name']} ({item['symbol']})", use_container_width=True, key=item['symbol']):
-                                st.session_state.selected_stock = item
-                                st.rerun()
-            else:
-                results_container.info("No results found.")
-    
-    else: # This block runs only AFTER a stock is selected
-        details = st.session_state.selected_stock
-        with st.container(border=True):
-            st.markdown(f"**{details['name']}**")
-            st.code(f"ID: {details['symbol']} | Exchange: {details['exchange']} | Type: {details['type']}")
+    if selected_ticker and selected_ticker not in ["NO_RESULTS", "ERROR", "INFO"]:
+        @st.cache_data(ttl=600)
+        def get_details_for_ticker(ticker: str):
+            try:
+                res = requests.get(f"{BACKEND_URL}/api/search", params={'query': ticker})
+                for item in res.json():
+                    if item['symbol'] == ticker:
+                        return item
+            except:
+                return None
+        
+        selected_stock_details = get_details_for_ticker(selected_ticker)
 
-        # FIXED: Conditions now correctly reflect the backend logic
-        condition_label = st.selectbox("Alert me when...", options=['Price is ≥ (Above)', 'Price is ≤ (Below)'])
+        if selected_stock_details:
+            with st.container(border=True):
+                st.markdown(f"**{selected_stock_details['name']}**")
+                st.code(f"ID: {selected_stock_details['symbol']} | Exchange: {selected_stock_details['exchange']} | Type: {selected_stock_details['type']}")
+        
+        condition_label = st.selectbox("Alert me when...", options=['Price is ≥ (Above or Equal)', 'Price is ≤ (Below or Equal)'])
         target_price = st.number_input("Target Price", value=1.00, min_value=0.01, format="%.2f")
         delete_on_trigger = st.checkbox("🗑️ One-time alert")
 
-        c1_form, c2_form = st.columns(2)
-        with c1_form:
-            if st.button("Set Alert", use_container_width=True, type="primary"):
-                condition_value = 'above' if 'Above' in condition_label else 'below'
-                payload = {"phone_number": USER_CONFIG['phone_number'], "ticker": details['symbol'], 
-                           "target_price": target_price, "condition": condition_value,
-                           "delete_on_trigger": delete_on_trigger}
-                try:
-                    requests.post(f"{BACKEND_URL}/api/add_alert", json=payload)
-                    st.success("✅ Alert set successfully!")
-                    st.session_state.selected_stock = None
-                    time.sleep(1)
-                    st.rerun()
-                except requests.ConnectionError:
-                    st.error("Could not connect to the backend.")
-        with c2_form:
-            if st.button("Clear Selection", use_container_width=True):
-                st.session_state.selected_stock = None
+        if st.button("Set Alert", use_container_width=True, type="primary"):
+            payload = {
+                "phone_number": USER_CONFIG['phone_number'],
+                "ticker": selected_ticker,
+                "target_price": target_price,
+                "condition": 'above' if '≥' in condition_label else 'below',
+                "delete_on_trigger": delete_on_trigger
+            }
+            try:
+                requests.post(f"{BACKEND_URL}/api/add_alert", json=payload)
+                st.success("✅ Alert set successfully!")
+                reset_searchbox_state()
+                time.sleep(1)
                 st.rerun()
+            except requests.ConnectionError:
+                st.error("Could not connect to the backend.")
 
 with col2:
     st.header("‼️ Your Active Alerts")
     if st.button("🔄 Refresh Alerts", use_container_width=True):
         st.rerun()
     try:
-        clean_phone = USER_CONFIG['phone_number']
-        res = requests.get(f"{BACKEND_URL}/api/get_alerts/{clean_phone}")
+        res = requests.get(f"{BACKEND_URL}/api/get_alerts/{USER_CONFIG['phone_number']}")
         alerts = res.json()
         if not alerts:
             st.info("You have no active alerts.")
